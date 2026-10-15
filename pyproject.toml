@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simulst-mm"
+version = "0.1.0"
+description = "Unified speech+LLM model for vLLM: serve the simultaneous-interpretation stack as one model"
+readme = "README.md"
+requires-python = ">=3.11"
+keywords = ["vllm", "speech", "simultaneous-interpretation", "multimodal", "asr"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+
+authors = [
+    { name = "pokoto", email = "40024614+lvbotenbest@users.noreply.github.com" },
+]
+dependencies = ["vllm>=0.13,<0.14"]
+
+[project.urls]
+Homepage = "https://github.com/lvbotenbest/simulst_mm"
+Source = "https://github.com/lvbotenbest/simulst_mm"
+
+# This is what makes `vllm serve <dir>` work with no extra flags and no manual
+# import. vLLM calls load_general_plugins() in the engine process
+# (v1/engine/core.py) and again in every worker subprocess
+# (v1/worker/worker_base.py), both before the model is instantiated, so the
+# architecture is registered everywhere it needs to be.
+[project.entry-points."vllm.general_plugins"]
+simulst_mm = "simulst_mm.plugin:register"
+
+# Boundary protection travels with the model, so no --logits-processors flag is
+# needed. This group is global -- vLLM constructs the class for every model
+# served from this environment -- so the processor checks the architecture and
+# disables itself for anything that is not ours.
+[project.entry-points."vllm.logits_processors"]
+simulst_boundary = "simulst_mm.model.boundary:BoundaryGreedyLogitsProcessor"
+
+[tool.setuptools.packages.find]
+include = ["simulst_mm*"]
