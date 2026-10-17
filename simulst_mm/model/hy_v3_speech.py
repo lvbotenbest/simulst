@@ -28,6 +28,7 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
+from simulst_mm.chat_template import AUDIO_CHUNK_PLACEHOLDER
 from simulst_mm.model.audio_encoder import AudioEncoderConfig
 from simulst_mm.model.audio_tower import AudioTower
 from simulst_mm.model.processing import (
@@ -74,10 +75,10 @@ class HYV3SpeechForCausalLM(nn.Module, SupportsMultiModal):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
-            # Prompts are built upstream and arrive pre-tokenised with the
-            # placeholders already in place, so nothing consumes this; it exists
-            # because the interface requires it.
-            return None
+            # The OpenAI chat route uses one wrapped audio token per chunk. The
+            # processor expands that token to the chunk's required speech-token
+            # run; pre-tokenised callers may still supply an expanded run.
+            return AUDIO_CHUNK_PLACEHOLDER
 
         raise ValueError(f"only the audio modality is supported, got {modality!r}")
 

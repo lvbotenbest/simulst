@@ -20,15 +20,20 @@ class PackageSmokeTest(unittest.TestCase):
 
         self.assertEqual(dist.metadata["Name"], "simulst-mm")
         self.assertEqual(dist.version, "0.1.0")
+        self.assertEqual(dist.metadata["Requires-Python"], ">=3.11,<3.14")
         self.assertIn(
             "pokoto <40024614+lvbotenbest@users.noreply.github.com>",
             dist.metadata.get("Author-email", ""),
         )
 
         requirements = " ".join(dist.requires or []).replace(" ", "").lower()
-        self.assertIn("vllm", requirements)
+        self.assertIn("vllm[audio]", requirements)
         self.assertIn(">=0.13", requirements)
         self.assertIn("<0.14", requirements)
+        self.assertIn("safetensors>=0.4", requirements)
+        self.assertIn("openai>=1.99.1", requirements)
+        self.assertIn("numpy>=1.26", requirements)
+        self.assertIn('extra=="client"', requirements)
 
         urls = set(dist.metadata.get_all("Project-URL") or [])
         self.assertIn(
@@ -58,6 +63,7 @@ class PackageSmokeTest(unittest.TestCase):
         dist = distribution("simulst-mm")
         files = {str(path).replace("\\", "/") for path in (dist.files or [])}
         required = {
+            "simulst_mm/chat_template.py",
             "simulst_mm/model/audio_encoder.py",
             "simulst_mm/model/audio_tower.py",
             "simulst_mm/model/boundary.py",

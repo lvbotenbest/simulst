@@ -5,7 +5,7 @@ LLM — as a **single vLLM model**.
 
 ```bash
 pip install simulst-mm
-vllm serve /path/to/unified_checkpoint --tensor-parallel-size 2 --enable-expert-parallel
+vllm serve /path/to/unified_checkpoint --served-model-name simulst
 ```
 
 No wrapper script, no manual `import`, no second model directory. Installing the
@@ -44,12 +44,15 @@ the deployment shape.**
 pip install simulst-mm
 ```
 
-The package requires **vLLM 0.13.x** and declares `vllm>=0.13,<0.14`
-(developed and verified against 0.13.0). PyTorch, transformers, and safetensors
-are installed through vLLM's dependency set.
+The package supports Python **3.11–3.13** and declares
+`vllm[audio]>=0.13,<0.14` plus `safetensors>=0.4`. It has been developed and
+verified against **vLLM 0.13.0**; later 0.13.x
+releases must be validated because this plugin uses internal multimodal APIs.
+The `audio` extra supplies the decoders required for HTTP `input_audio` parts.
 
 If the target environment already provides a compatible custom or locally built
 vLLM, use `pip install --no-deps simulst-mm` to prevent pip from replacing it.
+Install `simulst-mm[client]` to run the bundled OpenAI client example.
 
 Verify the install:
 
@@ -86,12 +89,40 @@ disk. A copy is used automatically when the paths are on different filesystems.
 shape, and falls back to built-in defaults when absent. Nothing outside the
 merged directory is read at serving time.
 
-## Usage
+The merge also installs an audio-aware `chat_template.jinja` and a
+`generation_config.json` for `/v1/chat/completions`. Pass
+`--no-openai-assets` only if the checkpoint must retain its original template.
+An existing merged checkpoint can be updated in place with:
 
-Prompts arrive **pre-tokenised**, with one run of audio placeholder tokens per
-chunk already in place — the simultaneous-interpretation protocol (turn
-structure, WAIT/EMIT policy, rolling window) stays in your client, where it
-belongs.
+```bash
+python -m simulst_mm.chat_template --model /path/to/unified_checkpoint
+```
+
+## OpenAI-compatible HTTP usage
+
+Start vLLM with the merged checkpoint:
+
+```bash
+vllm serve /path/to/unified_checkpoint --served-model-name simulst
+```
+
+Then run the reference streaming client:
+
+```bash
+pip install "simulst-mm[client]"
+python examples/openai_client.py --audio talk.wav --direction en-zh
+```
+
+Each turn sends an `input_audio` part to `/v1/chat/completions`; an empty reply
+means WAIT and non-empty text means EMIT. The client keeps the rolling history
+and chunk schedule. `/v1/completions` cannot carry audio and is not supported
+for this path.
+
+## In-process usage
+
+Pre-tokenised callers may still provide one expanded run of audio placeholder
+tokens per chunk. The simultaneous-interpretation protocol (turn structure,
+WAIT/EMIT policy, rolling window) remains in the client.
 
 ```python
 from vllm import LLM, SamplingParams
@@ -112,20 +143,6 @@ prompt = TokensPrompt(
 llm.generate([prompt], SamplingParams(temperature=0.7, max_tokens=128))
 ```
 
-### Known limitation: audio over HTTP
-
-`/v1/completions` **cannot carry audio**. `CompletionRequest` has
-`prompt_embeds` but no multi-modal field, so a `multi_modal_data` key is
-silently dropped — the server logs
-`fields ... ignored: {'multi_modal_data'}` and answers from the text prompt
-alone.
-
-Audio over HTTP would have to go through `/v1/chat/completions` with
-`input_audio` content parts, which inserts placeholders via
-`get_placeholder_str` and the chat template. This model's placeholders are
-produced upstream instead, so that route is **not yet implemented**. Until it
-is, drive the model in-process with `TokensPrompt` as shown above.
-
 ## Design notes
 
 **One chunk per encoder call.** Whisper-style feature extraction pads to the
@@ -134,13 +151,11 @@ in bf16 selects different kernels and shifts embeddings by ~0.03. Encoding one
 chunk at a time is bit-exact across repeated calls (12/12 identical); batching
 is not (0/12). The processor therefore extracts one waveform per call.
 
-**Placeholders are located, not generated.** vLLM's default per-item matcher
-cannot handle several placeholder runs made of the *same* token id: a shorter
-later run is a prefix of an earlier longer one, matches first, and the
-one-non-empty-REPLACE-per-pass rule then strands the earlier item. The
-processor overrides `_maybe_apply_prompt_updates` to use vLLM's left-to-right
-scanner, which assigns the n-th run to the n-th item and leaves token ids
-untouched.
+**Two placeholder shapes are supported.** The OpenAI chat template emits one
+audio token per chunk and the processor expands it to the required run. Existing
+`TokensPrompt` callers may supply those runs pre-expanded; the processor detects
+that shape and uses vLLM's left-to-right scanner so runs of the same token remain
+associated with the correct chunks.
 
 **Boundary protection travels with the model.** A logits processor registered
 through `vllm.logits_processors` masks end-of-turn and EOS for *sampling* rows

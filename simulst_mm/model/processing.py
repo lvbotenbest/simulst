@@ -1,24 +1,18 @@
 """Multi-modal processing: waveforms in, mel features and placeholder ranges out.
 
 One "audio item" is one chunk of the simultaneous-interpretation stream, not one
-utterance. The upper layer already builds the prompt -- instruction, turn
-markers, one run of ``audio_token_id`` per chunk sized by
-[`speech_tokens_from_num_samples`][] -- so this processor does not have to
-produce placeholders, only confirm where they are.
+utterance. Prompts reach this processor in one of two shapes:
 
-That shapes two decisions that differ from the in-tree audio models:
+* **Pre-expanded:** in-process ``TokensPrompt`` callers provide one complete run
+  of ``audio_token_id`` per chunk. The processor locates those runs without
+  changing the token ids.
+* **One token per chunk:** the OpenAI chat template renders a single
+  ``audio_token_id`` for each ``input_audio`` part. The processor expands each
+  token to the run required by that chunk.
 
-* **Prompts arrive pre-tokenised.** ``apply`` accepts ``list[int]``, so the
-  existing ``_prompt_ids`` output is passed through untouched and the chat
-  template stays in the client. The HF-processor call is then only ever asked
-  for mel features.
-* **The placeholders are located, not produced.** vLLM requires one
-  ``PromptUpdate`` per item (``_validate_mm_updates`` raises otherwise), so
-  returning nothing is not an option even though nothing needs replacing. The
-  update describes each item's run, and
-  [`SpeechMultiModalProcessor._maybe_apply_prompt_updates`][] routes it to
-  vLLM's left-to-right scanner instead of its per-item matcher -- the matcher
-  cannot tell two runs of the same token apart. See that method for why.
+The shape is determined by counting audio placeholder tokens against the audio
+items and their computed speech-token lengths. Both routes end with identical
+prompt token ids and placeholder ranges.
 
 Mel extraction runs one waveform at a time. The deployed frontend pads to
 ``max(len(waveform))`` across the batch, so batching changes the padded mel
@@ -124,6 +118,18 @@ def cached_feature_extractor(model_path: str) -> WhisperFeatureExtractor:
     # Cached on a module-level function rather than a method, so the key is the
     # path and not the (unhashable, per-request) info object.
     return WhisperFeatureExtractor.from_pretrained(model_path, local_files_only=True)
+
+
+def _is_audio_update_applied(found: int, num_items: int, expanded: int) -> bool:
+    if found == expanded:
+        return True
+    if found == num_items:
+        return False
+    raise ValueError(
+        f"prompt has {found} audio placeholder tokens for {num_items} audio chunks; "
+        f"expected either one per chunk ({num_items}) or the expanded total "
+        f"({expanded})"
+    )
 
 
 class SpeechDummyInputsBuilder(BaseDummyInputsBuilder[SpeechProcessingInfo]):
@@ -243,16 +249,13 @@ class SpeechMultiModalProcessor(BaseMultiModalProcessor[SpeechProcessingInfo]):
         def placeholder_run(item_idx: int) -> list[int]:
             return [audio_token_id] * int(token_lens[item_idx])
 
-        # Target and replacement are the same run: the placeholders are already
-        # in the prompt, and this exists only because vLLM requires one update
-        # per item to derive the PlaceholderRanges. Only ``replacement`` is ever
-        # read -- see ``_maybe_apply_prompt_updates`` below, which routes this
-        # through the scanner rather than the matcher -- but keeping ``target``
-        # equal to it states the intent.
+        # The chat template emits one target token per chunk; replacement grows
+        # it to the chunk's full run. For pre-expanded prompts only replacement
+        # is read by the left-to-right scanner below.
         return [
             PromptReplacement(
                 modality="audio",
-                target=placeholder_run,
+                target=[audio_token_id],
                 replacement=placeholder_run,
             )
         ]
@@ -265,40 +268,33 @@ class SpeechMultiModalProcessor(BaseMultiModalProcessor[SpeechProcessingInfo]):
         mm_prompt_updates: MultiModalPromptUpdates,
         is_update_applied: bool,
     ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
-        """Locate the placeholders instead of rewriting the prompt to produce them.
+        """Locate expanded placeholders or expand one-token-per-chunk inputs.
 
-        vLLM has two ways to end up with ``PlaceholderRange``s. The default one
-        runs the updates through ``_find_matches``, which searches the prompt for
-        each item's target independently. That cannot work here: every target is
-        a run of the *same* token, so item 1's 5-token run matches at the start
-        of item 0's 11-token run, and because ``_find_matches`` sorts by position
-        and then keeps only one non-empty REPLACE per pass
-        (``processing.py:729``), item 0 is dropped and ``prev_end_idx`` advances
-        past the only place it could have matched. The next pass finds nothing
-        and ``_apply_prompt_updates`` asserts.
+        vLLM's ``is_update_applied`` flag describes whether the prompt originated
+        as text or token ids, not which placeholder shape this model received.
+        Count the placeholder tokens instead: the expanded form has the sum of
+        all chunk run lengths, while the OpenAI form has one per chunk.
 
-        The other way is ``_iter_placeholders``, reached when the updates are
-        reported as already applied. It scans left to right and hands the n-th
-        run it finds to item n, which is exactly the chunk order the prompt was
-        built in -- and it is the truthful description of our situation, since
-        ``AudioSFTDataset`` put the placeholders in before vLLM ever saw the
-        prompt. It also leaves the token ids untouched, which the token-level
-        parity bar needs. ``_validate_mm_placeholders`` still runs, so a prompt
-        whose runs do not line up with its chunks is still rejected, just with a
-        message that names the real problem.
-
-        vLLM reaches this with ``is_update_applied=False`` whenever the prompt is
-        pre-tokenised -- ``_apply_hf_processor_main`` hardcodes it
-        (``processing.py:1656``) without consulting
-        ``_hf_processor_applies_updates`` -- so the override has to be here
-        rather than on that hook.
+        Expanded runs must use vLLM's left-to-right placeholder scanner. Its
+        per-item matcher cannot distinguish multiple runs made from the same
+        token when their lengths differ.
         """
+        audio_token_id = self.info.get_audio_token_id()
+        found = sum(token == audio_token_id for token in prompt_ids)
+        num_items = mm_items.get_count("audio", strict=False)
+        audios = mm_items.get("audio") if num_items else None
+        expanded = sum(
+            self.info.tokens_per_chunk(audios.get_audio_length(index))
+            for index in range(num_items)
+        )
+        already_expanded = _is_audio_update_applied(found, num_items, expanded)
+
         return super()._maybe_apply_prompt_updates(
             mm_items=mm_items,
             prompt_ids=prompt_ids,
             mm_kwargs=mm_kwargs,
             mm_prompt_updates=mm_prompt_updates,
-            is_update_applied=True,
+            is_update_applied=already_expanded,
         )
 
 

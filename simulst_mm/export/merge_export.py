@@ -25,6 +25,9 @@ What this writes:
 * ``preprocessor_config.json`` copied from the pretrained encoder directory, so
   the Whisper mel extractor resolves from the merged directory alone and the
   deployment no longer needs the separate encoder tree mounted.
+* an audio-aware ``chat_template.jinja`` and ``generation_config.json`` for
+  OpenAI-compatible ``/v1/chat/completions`` requests with ``input_audio``.
+  The original template remains the fallback for plain-string callers.
 
 Source directories are read-only; everything lands in ``--target``.
 
@@ -128,6 +131,11 @@ def parse_args(argv=None):
         help="copy the LLM shards instead of hard-linking them (57 GB)",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing target")
+    parser.add_argument(
+        "--no-openai-assets",
+        action="store_true",
+        help="do not install the audio-aware chat template and generation config",
+    )
     return parser.parse_args(argv)
 
 
@@ -244,6 +252,19 @@ def main(argv=None) -> int:
         if not required.is_file():
             raise SystemExit(f"missing required input: {required}")
 
+    turn_end_id = _turn_end_token_id(llm_dir)
+    if not args.no_openai_assets:
+        for required in (
+            llm_dir / "chat_template.jinja",
+            llm_dir / "tokenizer_config.json",
+        ):
+            if not required.is_file():
+                raise SystemExit(f"OpenAI chat assets require: {required}")
+        if turn_end_id is None:
+            raise SystemExit(
+                f"OpenAI chat assets require {TURN_END_TOKEN!r} to encode to one token"
+            )
+
     if target.exists():
         if not args.overwrite:
             raise SystemExit(f"{target} already exists (pass --overwrite to replace it)")
@@ -286,7 +307,6 @@ def main(argv=None) -> int:
     config["architectures"] = [ARCHITECTURE]
     config["audio_token_id"] = int(audio_manifest["audio_token_id"])
 
-    turn_end_id = _turn_end_token_id(llm_dir)
     if turn_end_id is not None:
         # Read by boundary.py, which has no tokenizer of its own.
         config["turn_end_token_id"] = turn_end_id
@@ -330,6 +350,14 @@ def main(argv=None) -> int:
         shutil.copy2(entry, target / entry.name)
         carried.append(entry.name)
     print(f"-- carried over {len(carried)} auxiliary file(s): {', '.join(carried)}")
+
+    if args.no_openai_assets:
+        print("-- skipped OpenAI chat assets (--no-openai-assets)")
+    else:
+        from simulst_mm.chat_template import write_openai_assets
+
+        for name in write_openai_assets(target):
+            print(f"-- wrote {name} for /v1/chat/completions")
 
     _write_json(
         target / "merge_manifest.json",
