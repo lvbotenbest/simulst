@@ -20,7 +20,8 @@ class PackageSmokeTest(unittest.TestCase):
 
         self.assertEqual(dist.metadata["Name"], "simulst-mm")
         self.assertEqual(dist.version, "0.1.0")
-        self.assertEqual(dist.metadata["Requires-Python"], ">=3.11,<3.14")
+        python_bounds = set(dist.metadata["Requires-Python"].replace(" ", "").split(","))
+        self.assertEqual(python_bounds, {">=3.11", "<3.14"})
         self.assertIn(
             "pokoto <40024614+lvbotenbest@users.noreply.github.com>",
             dist.metadata.get("Author-email", ""),
