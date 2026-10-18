@@ -92,6 +92,9 @@ class HYV3SpeechForCausalLM(nn.Module, SupportsMultiModal):
         if not isinstance(audio_config, Mapping):
             audio_config = audio_config.to_dict()
         self.audio_token_id = int(config.audio_token_id)
+        self.configure_mm_token_handling(
+            int(config.vocab_size), [self.audio_token_id]
+        )
 
         self.audio_tower = AudioTower(
             AudioEncoderConfig.from_dict(dict(audio_config)),
@@ -174,26 +177,6 @@ class HYV3SpeechForCausalLM(nn.Module, SupportsMultiModal):
             embeddings.append(chunk_embeddings)
 
         return embeddings
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
-    ) -> torch.Tensor:
-        # The placeholder is a real reserved token in this vocabulary, so the
-        # language model can embed it and no out-of-vocab buffer is needed.
-        if multimodal_embeddings is None or is_multimodal is None:
-            return super().embed_input_ids(input_ids)
-
-        return super().embed_input_ids(
-            input_ids,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_multimodal,
-            handle_oov_mm_token=handle_oov_mm_token,
-        )
 
     def forward(
         self,

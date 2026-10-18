@@ -4,7 +4,7 @@ Serve a speech simultaneous-interpretation stack — audio encoder, adapter, and
 LLM — as a **single vLLM model**.
 
 ```bash
-pip install simulst-mm
+pip install "simulst-mm[server]"
 vllm serve /path/to/unified_checkpoint --served-model-name simulst
 ```
 
@@ -40,19 +40,30 @@ the deployment shape.**
 
 ## Install
 
+The plugin supports Python **3.10–3.14** and upstream **vLLM 0.31.x**.
+Choose the installation mode that matches the environment:
+
 ```bash
-pip install simulst-mm
+# Existing vLLM 0.31 GPU environment: do not let pip touch the GPU stack.
+pip install --no-deps simulst-mm
+# Add only HTTP audio decoders if that vLLM was installed without its audio extra.
+pip install "simulst-mm[audio]"
+
+# New environment whose torch/CUDA packages may be managed by pip.
+pip install "simulst-mm[server]"
+
+# Optional checkpoint-export and reference-client tools.
+pip install "simulst-mm[export,client]"
 ```
 
-The package supports Python **3.11–3.13** and declares
-`vllm[audio]>=0.13,<0.14` plus `safetensors>=0.4`. It has been developed and
-verified against **vLLM 0.13.0**; later 0.13.x
-releases must be validated because this plugin uses internal multimodal APIs.
-The `audio` extra supplies the decoders required for HTTP `input_audio` parts.
-
-If the target environment already provides a compatible custom or locally built
-vLLM, use `pip install --no-deps simulst-mm` to prevent pip from replacing it.
-Install `simulst-mm[client]` to run the bundled OpenAI client example.
+The base package intentionally does not depend on vLLM. The `audio` extra
+installs only the decoder libraries used by vLLM's HTTP `input_audio` path;
+it does not depend on vLLM. The `server` extra installs
+`vllm[audio]>=0.31,<0.32`, including the same decoders. vLLM 0.31
+currently resolves a substantially newer stack (including torch 2.13 and
+Transformers 5) and defaults to CUDA 13 packages, with separate CUDA 12.9
+artifacts available. Do not install the `server` extra into an established GPU
+environment unless replacing that stack is intended.
 
 Verify the install:
 
@@ -71,9 +82,11 @@ You should see `simulst_mm` and `simulst_boundary`.
 The package expects one directory containing the LLM weights, the audio tower
 weights under an `audio_tower.` prefix, and a `config.json` whose
 `architectures` is `["HYV3SpeechForCausalLM"]`. If you have the two halves
-exported separately, merge them:
+exported separately, use an existing PyTorch/Transformers export environment,
+install the safetensors helper, and merge them:
 
 ```bash
+pip install "simulst-mm[export]"
 python -m simulst_mm.export.merge_export \
   --llm    /path/to/hf_export \
   --audio  /path/to/hf_export_audio \

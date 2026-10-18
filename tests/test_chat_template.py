@@ -17,7 +17,9 @@ from simulst_mm.chat_template import (
     TEMPLATE_FILE,
     TURN_END,
     USER,
+    assets_installed,
     generation_config,
+    missing_assets_error,
     unwrap_chat_template,
     wrap_chat_template,
     write_openai_assets,
@@ -118,6 +120,9 @@ class OpenAIAssetsTest(unittest.TestCase):
         "<｜hy_place▁holder▁no▁8｜>": 7,
     }
 
+    def setUp(self):
+        assets_installed.cache_clear()
+
     def make_model(self, root: Path):
         (root / "config.json").write_text(
             json.dumps(
@@ -160,6 +165,25 @@ class OpenAIAssetsTest(unittest.TestCase):
             self.assertTrue((model / TEMPLATE_FILE).read_text().startswith(MARKER))
             payload = json.loads((model / GENERATION_CONFIG_FILE).read_text())
             self.assertEqual(payload["eos_token_id"], [8, 4])
+            self.assertTrue(assets_installed(str(model)))
+
+    def test_missing_assets_reports_repair_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(assets_installed(tmp))
+            message = missing_assets_error(tmp)
+            self.assertIn("python -m simulst_mm.chat_template --model", message)
+            self.assertIn(tmp, message)
+
+    def test_missing_eos_token_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp)
+            self.make_model(model)
+            config = json.loads((model / "config.json").read_text())
+            config.pop("eos_token_id")
+            (model / "config.json").write_text(json.dumps(config))
+
+            with self.assertRaisesRegex(ValueError, "has no eos_token_id"):
+                write_openai_assets(model)
 
     def test_missing_special_token_fails(self):
         with tempfile.TemporaryDirectory() as tmp:

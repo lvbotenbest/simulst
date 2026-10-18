@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import lru_cache
 from pathlib import Path
 
 BOS = "<｜hy_begin▁of▁sentence｜>"
@@ -70,6 +71,28 @@ def unwrap_chat_template(template: str) -> str:
     if not template.startswith(MARKER):
         return template
     return template[len(SIMULST_BRANCH) : -len(BRANCH_END)]
+
+
+@lru_cache(maxsize=8)
+def assets_installed(model_dir: str) -> bool:
+    """Return whether the checkpoint contains the SimulST OpenAI branch."""
+    try:
+        head = (Path(model_dir) / TEMPLATE_FILE).read_text(encoding="utf-8")[
+            : len(MARKER)
+        ]
+    except OSError:
+        return False
+    return head == MARKER
+
+
+def missing_assets_error(model_dir: str) -> str:
+    return (
+        f"{model_dir} has no SimulST OpenAI chat template. Install the model "
+        "assets, then restart vLLM:\n"
+        f"    python -m simulst_mm.chat_template --model {model_dir}\n"
+        "Checkpoints produced by simulst_mm.export.merge_export include these "
+        "assets by default."
+    )
 
 
 def generation_config(

@@ -28,26 +28,28 @@ from typing import Any
 
 import numpy as np
 import torch
-from transformers import BatchFeature
+from transformers.feature_extraction_utils import BatchFeature
 from transformers.models.whisper import WhisperFeatureExtractor
 
-from vllm.config.multimodal import BaseDummyOptions
-from vllm.multimodal.inputs import (
-    MultiModalDataDict,
-    MultiModalFieldConfig,
-    MultiModalKwargsItems,
-    MultiModalKwargsOptionalItems,
-)
+from vllm.config.multimodal import MultiModalDummyOptions
+from vllm.inputs import MultiModalDataDict
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    MultiModalPromptUpdates,
-    PlaceholderFeaturesInfo,
     PromptReplacement,
     PromptUpdate,
 )
-from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.multimodal.processing.processor import (
+    HFMultiModalInputs,
+    MultiModalProcessingResult,
+    MultiModalPromptUpdates,
+    PlaceholderFeaturesInfo,
+)
+
+from simulst_mm.chat_template import assets_installed, missing_assets_error
 
 from simulst_mm.model.audio_tower import speech_tokens_from_num_samples
 
@@ -112,6 +114,9 @@ class SpeechProcessingInfo(BaseProcessingInfo):
             hop_length=self.get_hop_length(),
         )
 
+    def get_data_parser(self) -> MultiModalDataParser:
+        return MultiModalDataParser(target_sr=self.get_sampling_rate())
+
 
 @lru_cache(maxsize=4)
 def cached_feature_extractor(model_path: str) -> WhisperFeatureExtractor:
@@ -120,11 +125,11 @@ def cached_feature_extractor(model_path: str) -> WhisperFeatureExtractor:
     return WhisperFeatureExtractor.from_pretrained(model_path, local_files_only=True)
 
 
-def _is_audio_update_applied(found: int, num_items: int, expanded: int) -> bool:
+def _audio_placeholder_shape(found: int, num_items: int, expanded: int) -> str:
     if found == expanded:
-        return True
+        return "expanded"
     if found == num_items:
-        return False
+        return "compact"
     raise ValueError(
         f"prompt has {found} audio placeholder tokens for {num_items} audio chunks; "
         f"expected either one per chunk ({num_items}) or the expanded total "
@@ -150,10 +155,10 @@ class SpeechDummyInputsBuilder(BaseDummyInputsBuilder[SpeechProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: MultiModalDummyOptions,
     ) -> MultiModalDataDict:
         num_audios = mm_counts.get("audio", 0)
-        overrides = mm_options.get("audio") if mm_options else None
+        overrides = mm_options.get("audio")
         return {
             "audio": self._get_dummy_audios(
                 length=_DUMMY_CHUNK_SAMPLES,
@@ -164,37 +169,11 @@ class SpeechDummyInputsBuilder(BaseDummyInputsBuilder[SpeechProcessingInfo]):
 
 
 class SpeechMultiModalProcessor(BaseMultiModalProcessor[SpeechProcessingInfo]):
-    def _get_data_parser(self) -> MultiModalDataParser:
-        return MultiModalDataParser(target_sr=self.info.get_sampling_rate())
-
     def _mel_length(self, num_samples: int, hop_length: int) -> int:
-        """Round the padded waveform up to a whole number of hops.
-
-        Whisper-style extractors derive the frame mask with ``[:, ::hop_length]``
-        and drop the final frame when the padded length is not a hop multiple,
-        which would leave the encoder one frame short of the token count the
-        prompt reserves.
-        """
+        """Round the padded waveform up to a whole number of hops."""
         return -(-num_samples // hop_length) * hop_length
 
-    def _call_hf_processor(
-        self,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ) -> BatchFeature:
-        tokenizer = self.info.get_tokenizer()
-        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-
-        # input_ids must be a tensor, not a list: the caller does
-        # `processed_data.pop("input_ids").tolist()` (processing.py:1545).
-        input_ids = torch.tensor([prompt_ids], dtype=torch.long)
-
-        audios = mm_data.get("audios") or []
-        if not audios:
-            return BatchFeature(dict(input_ids=input_ids))
-
+    def _mel_features(self, audios) -> tuple[list[torch.Tensor], list[int]]:
         feature_extractor = self.info.get_feature_extractor()
         hop_length = self.info.get_hop_length()
         sampling_rate = self.info.get_sampling_rate()
@@ -203,7 +182,6 @@ class SpeechMultiModalProcessor(BaseMultiModalProcessor[SpeechProcessingInfo]):
         token_lens: list[int] = []
         for audio in audios:
             waveform = np.asarray(audio, dtype=np.float32)
-            # One waveform per call: see the module docstring on batching.
             extracted = feature_extractor(
                 [waveform],
                 sampling_rate=sampling_rate,
@@ -215,13 +193,29 @@ class SpeechMultiModalProcessor(BaseMultiModalProcessor[SpeechProcessingInfo]):
             length = int(extracted["attention_mask"].sum())
             features.append(extracted["input_features"][0, :, :length].contiguous())
             token_lens.append(self.info.tokens_per_chunk(len(waveform)))
+        return features, token_lens
 
-        return BatchFeature(
-            dict(
-                input_ids=input_ids,
-                audio_features=features,
-                audio_token_len=torch.tensor(token_lens, dtype=torch.long),
+    def _get_hf_mm_inputs(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_kwargs: Mapping[str, object],
+    ) -> HFMultiModalInputs:
+        audios = mm_items.get("audio")
+        if not audios:
+            return HFMultiModalInputs(
+                hf_data={}, hf_kwargs=hf_kwargs, passthrough_data={}
             )
+
+        features, token_lens = self._mel_features(
+            [audios.get(index) for index in range(audios.get_count())]
+        )
+        return HFMultiModalInputs(
+            hf_data={},
+            hf_kwargs=hf_kwargs,
+            passthrough_data={
+                "audio_features": features,
+                "audio_token_len": torch.tensor(token_lens, dtype=torch.long),
+            },
         )
 
     def _get_mm_fields_config(
@@ -260,25 +254,11 @@ class SpeechMultiModalProcessor(BaseMultiModalProcessor[SpeechProcessingInfo]):
             )
         ]
 
-    def _maybe_apply_prompt_updates(
+    def _prompt_shape(
         self,
         mm_items: MultiModalDataItems,
         prompt_ids: list[int],
-        mm_kwargs: MultiModalKwargsOptionalItems,
-        mm_prompt_updates: MultiModalPromptUpdates,
-        is_update_applied: bool,
-    ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
-        """Locate expanded placeholders or expand one-token-per-chunk inputs.
-
-        vLLM's ``is_update_applied`` flag describes whether the prompt originated
-        as text or token ids, not which placeholder shape this model received.
-        Count the placeholder tokens instead: the expanded form has the sum of
-        all chunk run lengths, while the OpenAI form has one per chunk.
-
-        Expanded runs must use vLLM's left-to-right placeholder scanner. Its
-        per-item matcher cannot distinguish multiple runs made from the same
-        token when their lengths differ.
-        """
+    ) -> str:
         audio_token_id = self.info.get_audio_token_id()
         found = sum(token == audio_token_id for token in prompt_ids)
         num_items = mm_items.get_count("audio", strict=False)
@@ -287,15 +267,40 @@ class SpeechMultiModalProcessor(BaseMultiModalProcessor[SpeechProcessingInfo]):
             self.info.tokens_per_chunk(audios.get_audio_length(index))
             for index in range(num_items)
         )
-        already_expanded = _is_audio_update_applied(found, num_items, expanded)
+        shape = _audio_placeholder_shape(found, num_items, expanded)
+        if shape == "compact":
+            model_dir = self.info.ctx.model_config.model
+            if not assets_installed(model_dir):
+                raise ValueError(missing_assets_error(model_dir))
+        return shape
 
-        return super()._maybe_apply_prompt_updates(
-            mm_items=mm_items,
-            prompt_ids=prompt_ids,
-            mm_kwargs=mm_kwargs,
-            mm_prompt_updates=mm_prompt_updates,
-            is_update_applied=already_expanded,
-        )
+    def _maybe_apply_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        mm_res: MultiModalProcessingResult,
+    ) -> tuple[list[int], Mapping[str, list[PlaceholderFeaturesInfo]]]:
+        """Expand compact placeholders or locate already-expanded runs.
+
+        The decision is local to this call; no request data is stored on the
+        processor instance, so concurrent preprocessing cannot cross-contaminate
+        placeholder ranges.
+        """
+        mm_item_counts = mm_items.get_all_counts()
+        self._validate_mm_kwargs(mm_res.kwargs, mm_item_counts)
+        self._validate_mm_updates(mm_res.prompt_updates, mm_item_counts)
+
+        if self._prompt_shape(mm_items, mm_res.prompt_ids) == "expanded":
+            prompt_ids = mm_res.prompt_ids
+            mm_placeholders = self._find_mm_placeholders(
+                prompt_ids, mm_res.prompt_updates
+            )
+        else:
+            prompt_ids, mm_placeholders = super()._apply_prompt_updates(
+                mm_res.prompt_ids, mm_res.prompt_updates
+            )
+
+        self._validate_mm_placeholders(mm_placeholders, mm_item_counts)
+        return prompt_ids, mm_placeholders
 
 
 __all__ = [

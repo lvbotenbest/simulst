@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simulst-mm"
-version = "0.1.0"
+version = "0.1.1rc1"
 description = "Unified speech+LLM model for vLLM: serve the simultaneous-interpretation stack as one model"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.10,<3.15"
 keywords = ["vllm", "speech", "simultaneous-interpretation", "multimodal", "asr"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -22,15 +22,21 @@ license-files = ["LICENSE"]
 authors = [
     { name = "pokoto", email = "40024614+lvbotenbest@users.noreply.github.com" },
 ]
-dependencies = [
-    "vllm[audio]>=0.13,<0.14",
-    "safetensors>=0.4",
-]
+dependencies = []
 
 [project.optional-dependencies]
+server = ["vllm[audio]>=0.31,<0.32"]
+audio = [
+    "av",
+    "scipy",
+    "soundfile",
+    "soxr",
+    "mistral-common[audio]>=1.11.6",
+]
+export = ["safetensors>=0.6.2"]
 client = [
     "numpy>=1.26",
-    "openai>=1.99.1",
+    "openai>=2.25,<3",
 ]
 
 [project.urls]
