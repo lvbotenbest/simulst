@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "simulst-mm"
-version = "0.1.1rc1"
+version = "0.1.1rc2"
 description = "Unified speech+LLM model for vLLM: serve the simultaneous-interpretation stack as one model"
 readme = "README.md"
 requires-python = ">=3.10,<3.15"

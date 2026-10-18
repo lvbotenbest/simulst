@@ -170,12 +170,12 @@ audio token per chunk and the processor expands it to the required run. Existing
 that shape and uses vLLM's left-to-right scanner so runs of the same token remain
 associated with the correct chunks.
 
-**Boundary protection travels with the model.** A logits processor registered
-through `vllm.logits_processors` masks end-of-turn and EOS for *sampling* rows
-unless they are already the argmax, so greedy decoding is provably unaffected.
-That entry-point group is global — vLLM builds the class for every model served
-from the environment — so the processor inspects the architecture and disables
-itself for anything else.
+**Boundary protection travels with the model.** A vLLM 0.31 Model Runner V2
+logits processor masks end-of-turn and EOS for sampling requests unless the
+boundary is already the argmax, so greedy boundary decisions are preserved.
+State is keyed by persistent request slot and expanded through vLLM's row mapping,
+including speculative-decoding rows. The entry point is global, so the processor
+inspects the architecture and disables itself for every other model.
 
 ## Verification
 

@@ -1,43 +1,34 @@
-"""Keep turn-boundary tokens on the greedy path while sampling the content.
+"""Keep turn-boundary tokens on the greedy path while sampling content.
 
-Transcribed from ``simulst_infer/vllm_boundary.py`` with one change: the token
-ids. That version reads module-level globals that ``SimulstEngine`` assigns
-before constructing the LLM (``engine.py:276-277``). Under ``vllm serve`` there
-is no engine object to assign them, so they are resolved here from the merged
-checkpoint -- ``config.json`` first, then the tokenizer, then the known ids as a
-last resort. The behaviour is otherwise identical.
+Each assistant turn is a simultaneous-translation policy decision: an empty
+turn plus EOT means WAIT, content plus EOT means EMIT, and EOS means the model
+predicts utterance end. Sampling may change wording, but must not randomly flip
+those boundary decisions.
 
-Why the masking exists at all: each assistant turn encodes a
-simultaneous-translation policy decision, not just wording.
-
-* empty content + EOT means WAIT (do not translate this chunk yet),
-* content + EOT means EMIT,
-* EOS is the model's utterance-end prediction.
-
-Sampling a content token trades one wording for another, which is the point of
-enabling sampling. Sampling a *boundary* token instead flips the policy on a
-coin toss. So this processor decides, per step, which regime applies: if the
-argmax is already a boundary token the row is left alone and the boundary wins;
-otherwise the boundary tokens are masked to -inf and the sampler chooses among
-content tokens only. The boundary ends up being whatever greedy decoding would
-have produced, while the wording is sampled.
+This implementation targets vLLM 0.31 Model Runner V2. Request state is keyed by
+persistent request slot and expanded to logits rows through
+``LogitsContext.expanded_idx_mapping``, including speculative-decoding rows.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
-import torch
-from vllm import SamplingParams
-from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessor, MoveDirectionality
+from vllm.v1.worker.gpu.sample.logits_processor import LogitsProcessor
 
 from simulst_mm.plugin import ARCHITECTURE
 
+if TYPE_CHECKING:
+    import torch
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.logits_processor import (
+        LogitsContext,
+        LogitsProcRequestState,
+    )
+
 logger = logging.getLogger(__name__)
 
-# The literal markers in this tokenizer. TURN_END_TOKEN matches
-# hytuner.utils.dataset.audio_sft_dataset.TURN_END_TOKEN; the ids are the ones
-# that vocabulary resolves them to, kept only as a last-resort fallback.
 TURN_END_TOKEN = "<｜hy_EOT｜>"
 DEFAULT_TURN_END_TOKEN_ID = 120008
 DEFAULT_EOS_TOKEN_ID = 120025
@@ -52,26 +43,15 @@ def _single_token_id(tokenizer, text: str) -> int | None:
 
 
 def serves_this_model(vllm_config) -> bool:
-    """Whether the model being served is the unified speech architecture.
-
-    The ``vllm.logits_processors`` entry point is global: once this package is
-    installed, vLLM constructs this processor for *every* model served from the
-    environment. Masking ids 120008/120025 in an unrelated vocabulary would be
-    silent corruption, so anything that is not our architecture gets a processor
-    that does nothing.
-    """
-    architectures = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
+    """Whether the served model is the unified speech architecture."""
+    architectures = (
+        getattr(vllm_config.model_config.hf_config, "architectures", None) or []
+    )
     return ARCHITECTURE in architectures
 
 
 def resolve_boundary_ids(vllm_config) -> tuple[int, int]:
-    """Find (turn_end_token_id, eos_token_id) for the model being served.
-
-    ``merge_export`` writes ``turn_end_token_id`` into config.json, so the first
-    branch is the normal one; the tokenizer lookup covers a checkpoint merged by
-    an older version, and the constants cover a tokenizer that cannot be loaded
-    inside the worker process.
-    """
+    """Resolve ``(turn_end_token_id, eos_token_id)`` for the checkpoint."""
     model_config = vllm_config.model_config
     hf_config = model_config.hf_config
 
@@ -90,7 +70,7 @@ def resolve_boundary_ids(vllm_config) -> tuple[int, int]:
                 trust_remote_code=model_config.trust_remote_code,
                 revision=model_config.tokenizer_revision,
             )
-        except Exception as error:  # pragma: no cover - depends on the checkpoint
+        except Exception as error:  # pragma: no cover - checkpoint dependent
             logger.warning("boundary protection could not load the tokenizer: %s", error)
         else:
             if turn_end_id is None:
@@ -112,92 +92,73 @@ def resolve_boundary_ids(vllm_config) -> tuple[int, int]:
 
 
 class BoundaryGreedyLogitsProcessor(LogitsProcessor):
-    """Mask EOT/EOS for sampling unless they are already the argmax."""
+    """Mask EOT/EOS for sampling unless that boundary is already the argmax."""
 
-    def __init__(self, vllm_config, device: torch.device, is_pin_memory: bool) -> None:
-        self.device = device
+    def __init__(
+        self,
+        vllm_config,
+        req_states: LogitsProcRequestState,
+    ) -> None:
         self.enabled = serves_this_model(vllm_config)
+        self.active_slots = None
         if not self.enabled:
-            # Installed globally, active only for our architecture. active_rows
-            # stays empty, so apply() returns the logits untouched.
-            self.boundary_ids = torch.empty(0, dtype=torch.long, device=device)
-            self.active_rows: set[int] = set()
             return
 
         turn_end_id, eos_id = resolve_boundary_ids(vllm_config)
+        for name, token_id in (
+            ("turn_end_token_id", turn_end_id),
+            ("eos_token_id", eos_id),
+        ):
+            if not 0 <= token_id < req_states.vocab_size:
+                raise ValueError(
+                    f"{name}={token_id} is outside vocabulary size "
+                    f"{req_states.vocab_size}"
+                )
+
+        # Heavy model-runner imports stay out of the frontend entry-point load.
+        import torch
+        from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+
         self.turn_end_token_id = turn_end_id
         self.eos_token_id = eos_id
-        self.boundary_ids = torch.tensor(
-            [turn_end_id, eos_id], dtype=torch.long, device=device
+        self.active_slots = StagedWriteTensor(
+            req_states.max_num_reqs,
+            dtype=torch.int32,
+            device=req_states.device,
         )
-        # Rows that opted in, i.e. requests that are sampling rather than greedy.
-        self.active_rows: set[int] = set()
 
     @classmethod
     def validate_params(cls, sampling_params: SamplingParams) -> None:
         return None
 
-    def is_argmax_invariant(self) -> bool:
-        # Masking never removes the argmax: when the argmax is a boundary token
-        # the row is skipped entirely, so greedy results are unchanged.
-        return True
+    def add_request(self, req_idx: int, sampling_params: SamplingParams) -> bool:
+        """Initialize a persistent slot and opt in sampling requests only."""
+        if not self.enabled:
+            return False
 
-    def update_state(self, batch_update: BatchUpdate | None) -> None:
-        if batch_update is None or not self.enabled:
-            return
+        active = getattr(sampling_params, "temperature", 0.0) != 0.0
+        # Always overwrite the recycled slot, including the inactive case.
+        self.active_slots.stage_write_elem(req_idx, int(active))
+        return active
 
-        for index in batch_update.removed:
-            self.active_rows.discard(index)
+    def apply_staged_writes(self) -> None:
+        if self.active_slots is not None:
+            self.active_slots.apply_write()
 
-        for index, params, _prompt_ids, _output_ids in batch_update.added:
-            # Greedy requests need no protection; argmax already decides.
-            sampling = getattr(params, "temperature", 0.0) > 0.0
-            if sampling:
-                self.active_rows.add(index)
-            else:
-                self.active_rows.discard(index)
-
-        for first, second, directionality in batch_update.moved:
-            first_active = first in self.active_rows
-            second_active = second in self.active_rows
-            if directionality == MoveDirectionality.SWAP:
-                self.active_rows.discard(first)
-                self.active_rows.discard(second)
-                if second_active:
-                    self.active_rows.add(first)
-                if first_active:
-                    self.active_rows.add(second)
-            else:
-                # Unidirectional move: first replaces second, first is vacated.
-                self.active_rows.discard(second)
-                if first_active:
-                    self.active_rows.add(second)
-                self.active_rows.discard(first)
-
-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        if not self.active_rows:
+    def apply(self, logits: torch.Tensor, ctx: LogitsContext) -> torch.Tensor:
+        if not self.enabled:
             return logits
 
-        rows = torch.tensor(
-            sorted(index for index in self.active_rows if index < logits.shape[0]),
-            dtype=torch.long,
-            device=logits.device,
+        # A request can own several logits rows under speculative decoding.
+        active_rows = self.active_slots.gpu[ctx.expanded_idx_mapping] != 0
+        argmax_ids = logits.argmax(-1)
+        argmax_is_boundary = (argmax_ids == self.turn_end_token_id) | (
+            argmax_ids == self.eos_token_id
         )
-        if rows.numel() == 0:
-            return logits
+        maskable = active_rows & ~argmax_is_boundary
 
-        selected = logits.index_select(0, rows)
-        argmax_ids = selected.argmax(dim=-1)
-        boundary_ids = self.boundary_ids.to(logits.device)
-        # Rows whose best token is a boundary are policy decisions: let them be.
-        argmax_is_boundary = (argmax_ids.unsqueeze(-1) == boundary_ids).any(dim=-1)
-
-        maskable = rows[~argmax_is_boundary]
-        if maskable.numel() == 0:
-            return logits
-
-        for token_id in boundary_ids.tolist():
-            logits[maskable, token_id] = float("-inf")
+        logits[maskable, self.turn_end_token_id] = float("-inf")
+        logits[maskable, self.eos_token_id] = float("-inf")
         return logits
 
 
