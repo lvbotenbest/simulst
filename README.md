@@ -1,10 +1,10 @@
-# simulst-mm
+# simulst
 
 Serve a speech simultaneous-interpretation stack — audio encoder, adapter, and
 LLM — as a **single vLLM model**.
 
 ```bash
-pip install "simulst-mm[server]"
+pip install "simulst[server]"
 vllm serve /path/to/unified_checkpoint --served-model-name simulst
 ```
 
@@ -45,15 +45,15 @@ Choose the installation mode that matches the environment:
 
 ```bash
 # Existing vLLM 0.31 GPU environment: do not let pip touch the GPU stack.
-pip install --no-deps simulst-mm
+pip install --no-deps simulst
 # Add only HTTP audio decoders if that vLLM was installed without its audio extra.
-pip install "simulst-mm[audio]"
+pip install "simulst[audio]"
 
 # New environment whose torch/CUDA packages may be managed by pip.
-pip install "simulst-mm[server]"
+pip install "simulst[server]"
 
 # Optional checkpoint-export and reference-client tools.
-pip install "simulst-mm[export,client]"
+pip install "simulst[export,client]"
 ```
 
 The base package intentionally does not depend on vLLM. The `audio` extra
@@ -86,7 +86,7 @@ exported separately, use an existing PyTorch/Transformers export environment,
 install the safetensors helper, and merge them:
 
 ```bash
-pip install "simulst-mm[export]"
+pip install "simulst[export]"
 python -m simulst_mm.export.merge_export \
   --llm    /path/to/hf_export \
   --audio  /path/to/hf_export_audio \
@@ -122,7 +122,7 @@ vllm serve /path/to/unified_checkpoint --served-model-name simulst
 Then run the reference streaming client:
 
 ```bash
-pip install "simulst-mm[client]"
+pip install "simulst[client]"
 python examples/openai_client.py --audio talk.wav --direction en-zh
 ```
 

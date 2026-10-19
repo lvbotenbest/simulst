@@ -63,7 +63,7 @@ class PluginTest(unittest.TestCase):
 
     def test_reports_missing_vllm(self):
         with patch.dict(sys.modules, {"vllm": None}):
-            with self.assertRaisesRegex(ImportError, r"simulst-mm\[server\]"):
+            with self.assertRaisesRegex(ImportError, r"simulst\[server\]"):
                 plugin.register()
 
 

@@ -16,10 +16,10 @@ class PackageSmokeTest(unittest.TestCase):
         self.assertNotIn("torch", sys.modules)
 
     def test_distribution_metadata(self):
-        dist = distribution("simulst-mm")
+        dist = distribution("simulst")
 
-        self.assertEqual(dist.metadata["Name"], "simulst-mm")
-        self.assertEqual(dist.version, "0.1.1rc2")
+        self.assertEqual(dist.metadata["Name"], "simulst")
+        self.assertEqual(dist.version, "0.1.0")
         python_bounds = set(dist.metadata["Requires-Python"].replace(" ", "").split(","))
         self.assertEqual(python_bounds, {">=3.10", "<3.15"})
         self.assertIn(
@@ -49,14 +49,14 @@ class PackageSmokeTest(unittest.TestCase):
 
         urls = set(dist.metadata.get_all("Project-URL") or [])
         self.assertIn(
-            "Homepage, https://github.com/lvbotenbest/simulst_mm", urls
+            "Homepage, https://github.com/lvbotenbest/simulst", urls
         )
         self.assertIn(
-            "Source, https://github.com/lvbotenbest/simulst_mm", urls
+            "Source, https://github.com/lvbotenbest/simulst", urls
         )
 
     def test_entry_points(self):
-        dist = distribution("simulst-mm")
+        dist = distribution("simulst")
         entry_points = {
             (entry.group, entry.name): entry.value
             for entry in dist.entry_points
@@ -72,7 +72,7 @@ class PackageSmokeTest(unittest.TestCase):
         )
 
     def test_namespace_model_files_are_in_wheel(self):
-        dist = distribution("simulst-mm")
+        dist = distribution("simulst")
         files = {str(path).replace("\\", "/") for path in (dist.files or [])}
         required = {
             "simulst_mm/chat_template.py",

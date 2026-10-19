@@ -34,9 +34,9 @@ def register() -> None:
         from vllm import ModelRegistry
     except ImportError as error:  # pragma: no cover - depends on the environment
         raise ImportError(
-            "simulst-mm requires upstream vLLM 0.31.x. Install a compatible "
-            "server environment with `pip install 'simulst-mm[server]'`, or "
-            "install vLLM first and then install simulst-mm with --no-deps."
+            "simulst requires upstream vLLM 0.31.x. Install a compatible "
+            "server environment with `pip install 'simulst[server]'`, or "
+            "install vLLM first and then install simulst with --no-deps."
         ) from error
 
     try:
@@ -45,7 +45,7 @@ def register() -> None:
         raise RuntimeError("vLLM is importable but has no package metadata") from error
     if not installed_version.split("+", 1)[0].startswith("0.31."):
         raise RuntimeError(
-            f"simulst-mm supports upstream vLLM 0.31.x; found {installed_version}"
+            f"simulst supports upstream vLLM 0.31.x; found {installed_version}"
         )
 
     supported = set(ModelRegistry.get_supported_archs())
