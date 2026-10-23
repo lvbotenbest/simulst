@@ -44,11 +44,26 @@ class PluginTest(unittest.TestCase):
         with patch.dict(sys.modules, {"vllm": self.vllm}), patch.object(
             plugin, "version", return_value="0.30.0"
         ):
-            with self.assertRaisesRegex(RuntimeError, "supports upstream vLLM 0.31.x"):
+            with self.assertRaisesRegex(RuntimeError, "requires upstream vLLM >=0.31"):
                 plugin.register()
 
         self.assertEqual(FakeRegistry.registrations, [])
         self.assertFalse(plugin._registered)
+
+    def test_accepts_newer_vllm_when_required_architecture_exists(self):
+        for installed_version in ("0.32.0", "1.0.0"):
+            with self.subTest(installed_version=installed_version):
+                plugin._registered = False
+                FakeRegistry.supported = {plugin.LANGUAGE_ARCHITECTURE}
+                FakeRegistry.registrations = []
+                with patch.dict(sys.modules, {"vllm": self.vllm}), patch.object(
+                    plugin, "version", return_value=installed_version
+                ):
+                    plugin.register()
+                self.assertEqual(
+                    FakeRegistry.registrations,
+                    [(plugin.ARCHITECTURE, plugin.MODEL_PATH)],
+                )
 
     def test_rejects_vllm_without_hyv3(self):
         FakeRegistry.supported = set()

@@ -19,7 +19,7 @@ class PackageSmokeTest(unittest.TestCase):
         dist = distribution("simulst")
 
         self.assertEqual(dist.metadata["Name"], "simulst")
-        self.assertEqual(dist.version, "0.1.0")
+        self.assertEqual(dist.version, "0.2.0rc1")
         python_bounds = set(dist.metadata["Requires-Python"].replace(" ", "").split(","))
         self.assertEqual(python_bounds, {">=3.10", "<3.15"})
         self.assertIn(
@@ -33,7 +33,7 @@ class PackageSmokeTest(unittest.TestCase):
         requirements = " ".join(requirement_list)
         self.assertIn("vllm[audio]", requirements)
         self.assertIn(">=0.31", requirements)
-        self.assertIn("<0.32", requirements)
+        self.assertNotIn("<0.32", requirements)
         self.assertIn("safetensors>=0.6.2", requirements)
         self.assertIn("mistral-common[audio]>=1.11.6", requirements)
         self.assertIn("soundfile", requirements)
@@ -70,6 +70,9 @@ class PackageSmokeTest(unittest.TestCase):
             entry_points[("vllm.logits_processors", "simulst_boundary")],
             "simulst_mm.model.boundary:BoundaryGreedyLogitsProcessor",
         )
+        self.assertFalse(
+            any(group == "console_scripts" for group, _name in entry_points)
+        )
 
     def test_namespace_model_files_are_in_wheel(self):
         dist = distribution("simulst")
@@ -81,9 +84,13 @@ class PackageSmokeTest(unittest.TestCase):
             "simulst_mm/model/boundary.py",
             "simulst_mm/model/hy_v3_speech.py",
             "simulst_mm/model/processing.py",
+            "simulst_mm/serving/__init__.py",
+            "simulst_mm/serving/async_backend.py",
         }
 
         self.assertTrue(required <= files, required - files)
+        self.assertNotIn("simulst_mm/serving/server.py", files)
+        self.assertNotIn("simulst_mm/serving/router.py", files)
         self.assertNotIn("simulst_mm/model/_vllm_compat.py", files)
 
 

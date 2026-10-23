@@ -24,6 +24,14 @@ MODEL_PATH = "simulst_mm.model.hy_v3_speech:HYV3SpeechForCausalLM"
 _registered = False
 
 
+def _release_pair(value: str) -> tuple[int, int]:
+    parts = value.split("+", 1)[0].split(".")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (IndexError, ValueError) as error:
+        raise RuntimeError(f"cannot parse vLLM version {value!r}") from error
+
+
 def register() -> None:
     """Register the unified speech+LLM architecture with vLLM."""
     global _registered
@@ -34,7 +42,7 @@ def register() -> None:
         from vllm import ModelRegistry
     except ImportError as error:  # pragma: no cover - depends on the environment
         raise ImportError(
-            "simulst requires upstream vLLM 0.31.x. Install a compatible "
+            "simulst requires upstream vLLM >=0.31. Install a compatible "
             "server environment with `pip install 'simulst[server]'`, or "
             "install vLLM first and then install simulst with --no-deps."
         ) from error
@@ -43,16 +51,16 @@ def register() -> None:
         installed_version = version("vllm")
     except PackageNotFoundError as error:  # pragma: no cover - broken environment
         raise RuntimeError("vLLM is importable but has no package metadata") from error
-    if not installed_version.split("+", 1)[0].startswith("0.31."):
+    if _release_pair(installed_version) < (0, 31):
         raise RuntimeError(
-            f"simulst supports upstream vLLM 0.31.x; found {installed_version}"
+            f"simulst requires upstream vLLM >=0.31; found {installed_version}"
         )
 
     supported = set(ModelRegistry.get_supported_archs())
     if LANGUAGE_ARCHITECTURE not in supported:
         raise RuntimeError(
             f"vLLM {installed_version} does not provide {LANGUAGE_ARCHITECTURE}; "
-            "install an upstream vLLM 0.31.x build that includes hy_v3"
+            "install an upstream vLLM >=0.31 build that includes hy_v3"
         )
 
     # Register lazily by module path only after every compatibility check passes.

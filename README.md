@@ -40,11 +40,11 @@ the deployment shape.**
 
 ## Install
 
-The plugin supports Python **3.10–3.14** and upstream **vLLM 0.31.x**.
+The plugin supports Python **3.10–3.14** and requires upstream **vLLM >=0.31**.
 Choose the installation mode that matches the environment:
 
 ```bash
-# Existing vLLM 0.31 GPU environment: do not let pip touch the GPU stack.
+# Existing vLLM >=0.31 GPU environment: do not let pip touch the GPU stack.
 pip install --no-deps simulst
 # Add only HTTP audio decoders if that vLLM was installed without its audio extra.
 pip install "simulst[audio]"
@@ -59,7 +59,9 @@ pip install "simulst[export,client]"
 The base package intentionally does not depend on vLLM. The `audio` extra
 installs only the decoder libraries used by vLLM's HTTP `input_audio` path;
 it does not depend on vLLM. The `server` extra installs
-`vllm[audio]>=0.31,<0.32`, including the same decoders. vLLM 0.31
+`vllm[audio]>=0.31`, including the same decoders. The missing upper bound avoids
+downgrading a newer vLLM already selected by the operator. It is not a promise
+that every future internal vLLM API will remain compatible. vLLM 0.31
 currently resolves a substantially newer stack (including torch 2.13 and
 Transformers 5) and defaults to CUDA 13 packages, with separate CUDA 12.9
 artifacts available. Do not install the `server` extra into an established GPU
@@ -76,6 +78,147 @@ for g in ('vllm.general_plugins', 'vllm.logits_processors'):
 ```
 
 You should see `simulst_mm` and `simulst_boundary`.
+
+## In-process concurrent turns
+
+`AsyncTurnRunner` provides a synchronous one-input/one-output facade over one
+shared vLLM `AsyncLLM`. Each caller blocks for its own final output, while calls
+from different threads run concurrently and may finish out of submission order:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+from simulst_mm.serving import AsyncTurnRunner
+
+# The factory runs on the runner's private asyncio thread and must return a
+# configured vLLM AsyncLLM instance.
+runner = AsyncTurnRunner(make_async_llm, timeout_seconds=900)
+try:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(runner.submit, prompt, sampling_params, owner=session_id)
+            for session_id, prompt in independent_turns
+        ]
+        outputs = [future.result() for future in futures]
+finally:
+    runner.close()
+```
+
+Prompts and audio arrays are treated as immutable for the duration of a request.
+Owner cancellation affects only that owner's active requests. This helper does
+not implement conversation history, HTTP/SSE/WebSocket transport, or
+multi-instance routing; those belong in a higher-level serving application.
+
+## Environment compatibility and troubleshooting
+
+`simulst` is pure Python, but it integrates with internal vLLM model,
+multimodal-processing, and logits-processing APIs. The supported server stack is
+therefore deliberately narrow:
+
+| component | supported / expected |
+|---|---|
+| Python | `>=3.10,<3.15` |
+| vLLM | `>=0.31` (0.31 adapted; 0.32 key interfaces source-checked) |
+| PyTorch | 2.13.0 for the vLLM 0.31.0 PyPI wheel |
+| Transformers | `>=5.10.4,<5.18` through vLLM |
+| FlashInfer core | `flashinfer-python==0.7.0.post1` through vLLM 0.31.0 |
+| `flashinfer-cubin` | optional; if installed, its version must exactly match FlashInfer |
+| `flashinfer-jit-cache` | optional; its version and CUDA suffix must match FlashInfer |
+| external `flash-attn` | not required by `simulst`; an old build may conflict with PyTorch 2.13 |
+| `deep-ep` | optional; only needed when that expert-parallel backend is selected |
+
+The vLLM 0.31 implementation and the key vLLM 0.32 AsyncLLM, multimodal, and
+Model Runner V2 interfaces have been checked. This is an API compatibility
+check, not a claim that every future `>=0.31` release has passed GPU/checkpoint
+end-to-end validation. Missing required model architecture or API capabilities
+fail at startup and require a `simulst` compatibility update.
+
+The exact torch, Transformers, FlashInfer, and CUDA packages are owned by vLLM.
+They are intentionally not pinned a second time by `simulst`. For an existing
+GPU environment, install this package with `--no-deps`. For a new environment,
+prefer a fresh Python 3.12 virtual environment and install `simulst[server]`.
+
+Inspect the active environment before troubleshooting:
+
+```bash
+python - <<'PY'
+from importlib.metadata import PackageNotFoundError, version
+import torch
+
+for name in (
+    "simulst",
+    "vllm",
+    "torch",
+    "transformers",
+    "flashinfer-python",
+    "flashinfer-cubin",
+    "flashinfer-jit-cache",
+    "flash-attn",
+    "deep-ep",
+):
+    try:
+        print(f"{name}: {version(name)}")
+    except PackageNotFoundError:
+        print(f"{name}: not installed")
+print("torch CUDA:", torch.version.cuda)
+PY
+```
+
+### `undefined symbol` from `flash_attn_2_cuda` or `deep_ep_cpp`
+
+This means a compiled extension was built against a different PyTorch ABI,
+usually because vLLM upgraded torch while an old extension remained installed.
+Neither external `flash-attn` nor `deep-ep` is required for a single-GPU default
+deployment. If those backends are not intentionally used, remove the stale
+extensions and restart vLLM:
+
+```bash
+python -m pip uninstall -y flash-attn deep-ep
+```
+
+If either backend is required, rebuild it against the exact torch and CUDA
+versions in the active environment instead of bypassing the import error.
+
+### FlashInfer package version mismatch
+
+An error such as:
+
+```text
+flashinfer-cubin version (X) does not match flashinfer version (Y)
+```
+
+means an optional precompiled artifact does not match `flashinfer-python`.
+`flashinfer-cubin` and `flashinfer-jit-cache` are not required: FlashInfer can
+compile or download kernels on first use. The simplest repair is:
+
+```bash
+python -m pip uninstall -y flashinfer-cubin flashinfer-jit-cache
+```
+
+If precompiled/offline kernels are required, install matching artifacts from the
+FlashInfer wheel index. All FlashInfer package versions must match exactly, and
+the JIT-cache index must match the torch CUDA build (`cu129` or `cu130`). Use
+`FLASHINFER_DISABLE_VERSION_CHECK=1` only while running FlashInfer's artifact
+installation command to replace a mismatched package; do not keep it in the
+vLLM service environment.
+
+### GPU memory utilization check fails
+
+If vLLM reports that free memory is below its requested utilization, first stop
+other GPU processes or lower the target, for example:
+
+```bash
+vllm serve /path/to/unified_checkpoint \
+  --served-model-name simulst \
+  --gpu-memory-utilization 0.88
+```
+
+### Network interface errors from Gloo or NCCL
+
+Single-node vLLM still initializes distributed communication. If an inherited
+`GLOO_SOCKET_IFNAME` or `NCCL_SOCKET_IFNAME` names a missing interface, select a
+real interface shown by `ip -br addr`. `lo` is suitable only for single-node
+runs; multi-node deployments need a routable interface shared by all nodes.
 
 ## Preparing a checkpoint
 
