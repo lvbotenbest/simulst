@@ -18,6 +18,10 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
+class _TurnTimedOut(Exception):
+    pass
+
+
 class AsyncTurnRunner:
     """Thread-safe synchronous facade over a shared asynchronous vLLM engine."""
 
@@ -137,8 +141,20 @@ class AsyncTurnRunner:
                     final = output
             return final
 
+        consume_task = asyncio.create_task(consume())
         try:
-            final = await asyncio.wait_for(consume(), timeout=self.timeout_seconds)
+            try:
+                done, _ = await asyncio.wait(
+                    (consume_task,), timeout=self.timeout_seconds
+                )
+                if not done:
+                    raise _TurnTimedOut
+                final = consume_task.result()
+            finally:
+                if not consume_task.done():
+                    consume_task.cancel()
+                    await asyncio.gather(consume_task, return_exceptions=True)
+
             if final is None:
                 raise RuntimeError("vLLM ended without a final output")
             with self._stats_lock:
@@ -178,7 +194,12 @@ class AsyncTurnRunner:
                 ),
                 self.loop,
             )
-        return future.result()
+        try:
+            return future.result()
+        except _TurnTimedOut as error:
+            raise TimeoutError(
+                f"async vLLM turn timed out after {self.timeout_seconds:g} seconds"
+            ) from error
 
     def cancel_owner(self, owner) -> None:
         if threading.current_thread() is self.thread:

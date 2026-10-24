@@ -19,7 +19,7 @@ class PackageSmokeTest(unittest.TestCase):
         dist = distribution("simulst")
 
         self.assertEqual(dist.metadata["Name"], "simulst")
-        self.assertEqual(dist.version, "0.2.0rc1")
+        self.assertEqual(dist.version, "0.1.0")
         python_bounds = set(dist.metadata["Requires-Python"].replace(" ", "").split(","))
         self.assertEqual(python_bounds, {">=3.10", "<3.15"})
         self.assertIn(

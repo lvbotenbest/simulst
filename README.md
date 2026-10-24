@@ -4,14 +4,20 @@ Serve a speech simultaneous-interpretation stack — audio encoder, adapter, and
 LLM — as a **single vLLM model**.
 
 ```bash
-pip install "simulst[server]"
+# Existing compatible vLLM GPU environment: keep its torch/CUDA stack unchanged.
+python -m pip install --no-deps simulst
+
+# Or, in a fresh Python 3.12 environment whose GPU stack pip may manage:
+python -m pip install "simulst[server]"
+
 vllm serve /path/to/unified_checkpoint --served-model-name simulst
 ```
 
 No wrapper script, no manual `import`, no second model directory. Installing the
 package is enough: it registers the architecture through vLLM's
 `vllm.general_plugins` entry point, which vLLM calls in the engine process and
-in every tensor-parallel worker before the model is built.
+in every tensor-parallel worker before the model is built. One server can accept
+multiple concurrent HTTP requests; vLLM queues and schedules them.
 
 ## What problem this solves
 
@@ -40,20 +46,22 @@ the deployment shape.**
 
 ## Install
 
-The plugin supports Python **3.10–3.14** and requires upstream **vLLM >=0.31**.
-Choose the installation mode that matches the environment:
+The plugin supports CPython **3.10, 3.11, 3.12, 3.13, and 3.14**
+(`>=3.10,<3.15`) and requires upstream **vLLM >=0.31**. Python 3.12 is the
+recommended default for a new environment. Choose the installation mode that
+matches the environment:
 
 ```bash
 # Existing vLLM >=0.31 GPU environment: do not let pip touch the GPU stack.
-pip install --no-deps simulst
+python -m pip install --no-deps simulst
 # Add only HTTP audio decoders if that vLLM was installed without its audio extra.
-pip install "simulst[audio]"
+python -m pip install "simulst[audio]"
 
 # New environment whose torch/CUDA packages may be managed by pip.
-pip install "simulst[server]"
+python -m pip install "simulst[server]"
 
 # Optional checkpoint-export and reference-client tools.
-pip install "simulst[export,client]"
+python -m pip install "simulst[export,client]"
 ```
 
 The base package intentionally does not depend on vLLM. The `audio` extra
@@ -78,36 +86,6 @@ for g in ('vllm.general_plugins', 'vllm.logits_processors'):
 ```
 
 You should see `simulst_mm` and `simulst_boundary`.
-
-## In-process concurrent turns
-
-`AsyncTurnRunner` provides a synchronous one-input/one-output facade over one
-shared vLLM `AsyncLLM`. Each caller blocks for its own final output, while calls
-from different threads run concurrently and may finish out of submission order:
-
-```python
-from concurrent.futures import ThreadPoolExecutor
-
-from simulst_mm.serving import AsyncTurnRunner
-
-# The factory runs on the runner's private asyncio thread and must return a
-# configured vLLM AsyncLLM instance.
-runner = AsyncTurnRunner(make_async_llm, timeout_seconds=900)
-try:
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = [
-            pool.submit(runner.submit, prompt, sampling_params, owner=session_id)
-            for session_id, prompt in independent_turns
-        ]
-        outputs = [future.result() for future in futures]
-finally:
-    runner.close()
-```
-
-Prompts and audio arrays are treated as immutable for the duration of a request.
-Owner cancellation affects only that owner's active requests. This helper does
-not implement conversation history, HTTP/SSE/WebSocket transport, or
-multi-instance routing; those belong in a higher-level serving application.
 
 ## Environment compatibility and troubleshooting
 
@@ -229,7 +207,7 @@ exported separately, use an existing PyTorch/Transformers export environment,
 install the safetensors helper, and merge them:
 
 ```bash
-pip install "simulst[export]"
+python -m pip install "simulst[export]"
 python -m simulst_mm.export.merge_export \
   --llm    /path/to/hf_export \
   --audio  /path/to/hf_export_audio \
@@ -254,25 +232,65 @@ An existing merged checkpoint can be updated in place with:
 python -m simulst_mm.chat_template --model /path/to/unified_checkpoint
 ```
 
-## OpenAI-compatible HTTP usage
+## OpenAI-compatible HTTP deployment and concurrency
 
-Start vLLM with the merged checkpoint:
+Activate the same Python environment that contains vLLM and `simulst`, then
+start one vLLM server with the unified checkpoint:
 
 ```bash
-vllm serve /path/to/unified_checkpoint --served-model-name simulst
+vllm serve /path/to/unified_checkpoint \
+  --served-model-name simulst \
+  --host 0.0.0.0 \
+  --port 8000
 ```
 
-Then run the reference streaming client:
+That command already supports concurrent HTTP requests. Multiple clients send
+independent requests to `/v1/chat/completions`; the one vLLM engine queues them
+and applies continuous batching. Do not start one model process per request, and
+do not add `AsyncTurnRunner` around the HTTP server.
+
+For example, a two-GPU deployment with capacity for up to eight scheduled
+sequences can be started as follows when those settings match the checkpoint and
+hardware:
 
 ```bash
-pip install "simulst[client]"
+CUDA_VISIBLE_DEVICES=0,1 vllm serve /path/to/unified_checkpoint \
+  --served-model-name simulst \
+  --tensor-parallel-size 2 \
+  --enable-expert-parallel \
+  --max-num-seqs 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+`--tensor-parallel-size` and `--enable-expert-parallel` configure model
+parallelism, not HTTP concurrency. `--max-num-seqs` is scheduler capacity, not a
+hard HTTP connection limit; excess requests may wait. Available admission and
+scheduler flags vary by vLLM release, so inspect the installed CLI before adding
+version-specific tuning:
+
+```bash
+vllm serve --help | grep -E "max-num-seqs|max-num-active-seqs"
+```
+
+To run the repository's reference streaming client, use a source checkout
+(`examples/` is not installed by the wheel):
+
+```bash
+python -m pip install "simulst[client]"
+# Refresh an older unified checkpoint once to install the current chat template.
+python -m simulst_mm.chat_template --model /path/to/unified_checkpoint
+# Default: source text plus translation; appends control token 120808.
 python examples/openai_client.py --audio talk.wav --direction en-zh
+# Translation-only model: do not append the control token.
+python examples/openai_client.py --audio talk.wav --direction en-zh \
+  --output-mode translation
 ```
 
-Each turn sends an `input_audio` part to `/v1/chat/completions`; an empty reply
-means WAIT and non-empty text means EMIT. The client keeps the rolling history
-and chunk schedule. `/v1/completions` cannot carry audio and is not supported
-for this path.
+The example writes each raw server JSON response to stdout. It is only a
+protocol reference; production conversation and result handling belong in the
+downstream inference service. `/v1/completions` cannot carry audio and is not
+supported for this path.
 
 ## In-process usage
 
@@ -298,6 +316,40 @@ prompt = TokensPrompt(
 )
 llm.generate([prompt], SamplingParams(temperature=0.7, max_tokens=128))
 ```
+
+## In-process AsyncLLM concurrency without HTTP
+
+This helper is for applications that create vLLM `AsyncLLM` directly instead
+of running `vllm serve`. HTTP clients do not need it: send concurrent requests
+to the server as described above.
+
+`AsyncTurnRunner` provides a synchronous one-input/one-output facade over one
+shared `AsyncLLM`. Each caller blocks for its own final output, while calls from
+different threads run concurrently and may finish out of submission order:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+
+from simulst_mm.serving import AsyncTurnRunner
+
+# The factory runs on the runner's private asyncio thread and must return a
+# configured vLLM AsyncLLM instance.
+runner = AsyncTurnRunner(make_async_llm, timeout_seconds=900)
+try:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(runner.submit, prompt, sampling_params, owner=session_id)
+            for session_id, prompt in independent_turns
+        ]
+        outputs = [future.result() for future in futures]
+finally:
+    runner.close()
+```
+
+Prompts and audio arrays are treated as immutable for the duration of a request.
+Owner cancellation affects only that owner's active requests. This helper does
+not implement conversation history, HTTP/SSE/WebSocket transport, or
+multi-instance routing; those belong in a higher-level serving application.
 
 ## Design notes
 

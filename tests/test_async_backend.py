@@ -133,10 +133,32 @@ class AsyncTurnRunnerTest(unittest.TestCase):
     def test_timeout_aborts_only_that_request(self):
         engine = FakeEngine()
         runner = self.runner(engine, timeout_seconds=0.01)
-        with self.assertRaises(TimeoutError):
+        with self.assertRaises(TimeoutError) as caught:
             runner.submit({"delay": 1}, SimpleNamespace(output_kind=None))
+        self.assertIs(type(caught.exception), TimeoutError)
         self.assertEqual(len(engine.aborted), 1)
-        self.assertEqual(runner.stats()["async_turn_active"], 0)
+        self.assertEqual(
+            runner.stats(),
+            {
+                "async_turn_submitted": 1,
+                "async_turn_active": 0,
+                "async_turn_completed": 0,
+                "async_turn_failed": 1,
+                "async_turn_cancelled": 0,
+            },
+        )
+
+    def test_engine_timeout_error_is_not_rewritten_as_runner_timeout(self):
+        engine = FakeEngine()
+        runner = self.runner(engine)
+        with self.assertRaisesRegex(TimeoutError, "engine transport failed") as caught:
+            runner.submit(
+                {"error": TimeoutError("engine transport failed")},
+                SimpleNamespace(output_kind=None),
+            )
+        self.assertIs(type(caught.exception), TimeoutError)
+        self.assertEqual(len(engine.aborted), 1)
+        self.assertEqual(runner.stats()["async_turn_failed"], 1)
 
     def test_cancel_owner_does_not_cancel_other_owner(self):
         engine = FakeEngine()

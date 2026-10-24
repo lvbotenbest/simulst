@@ -3,23 +3,30 @@
     vllm serve /path/to/unified_checkpoint --served-model-name simulst
     python examples/openai_client.py --audio talk.wav --direction en-zh
 
-The client sends a 1600 ms first chunk followed by 800 ms chunks. Each response
-is appended verbatim to the conversation: an empty response represents WAIT,
-and non-empty text represents EMIT.
+The client sends a 1600 ms first chunk followed by 800 ms chunks. Bilingual
+mode appends control token 120808 to the generation prompt; translation mode
+does not. Raw HTTP response JSON is written to stdout and diagnostics to stderr.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import json
 import struct
+import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import wave
 
 import numpy as np
 from openai import OpenAI
 
 SAMPLE_RATE = 16_000
+BILINGUAL_CONTROL_TOKEN_ID = 120808
+BILINGUAL_CONTROL_TOKEN = "<｜hy_place▁holder▁no▁790｜>"
 INSTRUCTIONS = {
     "en-zh": "请完成下面的同声传译任务，将陆续收到的语音翻译成中文。请结合上下文边听边译，输出能够确定的译文，不必等待整句结束。",
     "zh-en": "请完成下面的同声传译任务，将陆续收到的语音翻译成英文。请结合上下文边听边译，输出能够确定的译文，不必等待整句结束。",
@@ -54,6 +61,83 @@ def float_wav_base64(samples: np.ndarray) -> str:
     )
     header += b"data" + struct.pack("<I", len(data))
     return base64.b64encode(header + data).decode("ascii")
+
+
+def chat_template_kwargs(output_mode: str) -> dict[str, str]:
+    return {"simulst_output_mode": output_mode}
+
+
+def reply_is_emit(text: str, output_mode: str) -> bool:
+    """Validate one assistant reply and return its WAIT/EMIT decision."""
+    if output_mode == "translation":
+        return bool(text)
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError("bilingual message.content is not valid JSON") from error
+    if not isinstance(payload, dict):
+        raise ValueError("bilingual message.content must be a JSON object")
+    for field in ("src", "tgt"):
+        if field not in payload:
+            raise ValueError(f"bilingual message.content has no {field!r} field")
+        if not isinstance(payload[field], str):
+            raise ValueError(f"bilingual message.content field {field!r} must be a string")
+    return bool(payload["src"] or payload["tgt"])
+
+
+def write_raw_json(payload: bytes, stream=None) -> None:
+    """Write one unmodified HTTP JSON body followed by a record separator."""
+    stream = sys.stdout.buffer if stream is None else stream
+    stream.write(payload)
+    if not payload.endswith(b"\n"):
+        stream.write(b"\n")
+    stream.flush()
+
+
+def _tokenize_url(base_url: str) -> str:
+    parsed = urllib.parse.urlsplit(base_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3]
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path + "/tokenize", "", "")
+    )
+
+
+def verify_bilingual_control_token(base_url: str, model: str) -> bool:
+    """Best-effort check that the server maps the bilingual marker to 120808."""
+    request = urllib.request.Request(
+        _tokenize_url(base_url),
+        data=json.dumps(
+            {
+                "model": model,
+                "prompt": BILINGUAL_CONTROL_TOKEN,
+                "add_special_tokens": False,
+            }
+        ).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer EMPTY",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read())
+    except (OSError, ValueError, urllib.error.HTTPError, urllib.error.URLError) as error:
+        print(
+            f"warning: could not verify bilingual control token: {error}",
+            file=sys.stderr,
+        )
+        return False
+
+    token_ids = payload.get("tokens") if isinstance(payload, dict) else None
+    if token_ids != [BILINGUAL_CONTROL_TOKEN_ID]:
+        raise ValueError(
+            f"server tokenized {BILINGUAL_CONTROL_TOKEN!r} as {token_ids!r}; "
+            f"expected [{BILINGUAL_CONTROL_TOKEN_ID}]"
+        )
+    return True
 
 
 class Conversation:
@@ -94,8 +178,17 @@ def main() -> int:
     parser.add_argument("--chunk-ms", type=int, default=800)
     parser.add_argument("--window-seconds", type=float, default=25.0)
     parser.add_argument("--max-window-seconds", type=float, default=30.0)
-    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument(
+        "--output-mode",
+        choices=("bilingual", "translation"),
+        default="bilingual",
+        help="bilingual appends control token 120808; translation does not",
+    )
     args = parser.parse_args()
+
+    if args.output_mode == "bilingual":
+        verify_bilingual_control_token(args.base_url, args.model)
 
     client = OpenAI(base_url=args.base_url, api_key="EMPTY")
     waveform = load_wav(args.audio)
@@ -105,7 +198,6 @@ def main() -> int:
     hard = int(args.max_window_seconds * SAMPLE_RATE)
 
     conversation = Conversation(args.direction)
-    outputs: list[str] = []
     cursor = 0
     while cursor < len(waveform):
         size = first if not conversation.messages else regular
@@ -113,28 +205,34 @@ def main() -> int:
         cursor += size
 
         started = time.monotonic()
-        response = client.chat.completions.create(
+        raw_response = client.chat.completions.with_raw_response.create(
             model=args.model,
             messages=conversation.messages,
             temperature=0.0,
             max_tokens=args.max_tokens,
+            extra_body={
+                "chat_template_kwargs": chat_template_kwargs(args.output_mode),
+            },
         )
+        write_raw_json(raw_response.content)
+        response = raw_response.parse()
         text = response.choices[0].message.content or ""
+        emit = reply_is_emit(text, args.output_mode)
         conversation.add_reply(text)
         elapsed_ms = (time.monotonic() - started) * 1000
-        action = "EMIT" if text else "WAIT"
+        action = "EMIT" if emit else "WAIT"
         seconds = min(cursor, len(waveform)) / SAMPLE_RATE
-        print(f"{seconds:7.1f}s {action} {elapsed_ms:6.0f}ms  {text}", flush=True)
-        if text:
-            outputs.append(text.strip())
+        print(
+            f"{seconds:7.1f}s {action} {elapsed_ms:6.0f}ms",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if conversation.audio_samples >= hard or (
-            conversation.audio_samples >= soft and text
+            conversation.audio_samples >= soft and emit
         ):
             conversation = Conversation(args.direction)
 
-    joiner = "" if args.direction.endswith("zh") else " "
-    print("\n" + joiner.join(outputs))
     return 0
 
 

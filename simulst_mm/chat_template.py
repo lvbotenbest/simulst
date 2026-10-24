@@ -23,54 +23,83 @@ AUDIO_BEGIN = "<｜hy_place▁holder▁no▁6｜>"
 AUDIO_TOKEN = "<｜hy_place▁holder▁no▁5｜>"
 AUDIO_END = "<｜hy_place▁holder▁no▁8｜>"
 AUDIO_CHUNK_PLACEHOLDER = f"{AUDIO_BEGIN}{AUDIO_TOKEN}{AUDIO_END}"
+BILINGUAL_CONTROL_TOKEN_ID = 120808
+BILINGUAL_CONTROL_TOKEN = "<｜hy_place▁holder▁no▁790｜>"
 
 TEMPLATE_FILE = "chat_template.jinja"
 GENERATION_CONFIG_FILE = "generation_config.json"
-MARKER = "{#- simulst-mm openai chat branch v1 #}"
+LEGACY_MARKER = "{#- simulst-mm openai chat branch v1 #}"
+MARKER = "{#- simulst-mm openai chat branch v2 #}"
 DEFAULT_MAX_NEW_TOKENS = 64
-
-SIMULST_BRANCH = (
-    MARKER + "\n"
-    "{%- if messages and messages[0]['content'] is not string -%}\n"
-    f"{{{{- '{BOS}{REASONING_PREFIX}' -}}}}\n"
-    "{%- for message in messages -%}\n"
-    "{%- if message['role'] == 'user' -%}\n"
-    f"{{{{- '{USER}' -}}}}\n"
-    "{%- for part in message['content'] -%}\n"
-    "{%- if part['type'] == 'text' -%}{{- part['text'] -}}\n"
-    f"{{%- elif part['type'] in ['audio', 'input_audio'] -%}}{{{{- '{AUDIO_CHUNK_PLACEHOLDER}' -}}}}\n"
-    "{%- endif -%}\n"
-    "{%- endfor -%}\n"
-    "{%- elif message['role'] == 'assistant' -%}\n"
-    f"{{{{- '{ASSISTANT}{EMPTY_THINK}' -}}}}\n"
-    "{%- if message['content'] is string -%}\n"
-    "{{- message['content'] -}}\n"
-    "{%- else -%}\n"
-    "{%- for part in message['content'] -%}\n"
-    "{%- if part['type'] == 'text' -%}{{- part['text'] -}}{%- endif -%}\n"
-    "{%- endfor -%}\n"
-    "{%- endif -%}\n"
-    f"{{{{- '{TURN_END}' -}}}}\n"
-    "{%- endif -%}\n"
-    "{%- endfor -%}\n"
-    f"{{%- if add_generation_prompt -%}}{{{{- '{ASSISTANT}{EMPTY_THINK}' -}}}}{{%- endif -%}}\n"
-    "{%- else -%}\n"
-)
 BRANCH_END = "\n{%- endif -%}\n"
 
 
+def _simulst_branch(marker: str, generation_prompt: str) -> str:
+    return (
+        marker + "\n"
+        "{%- if messages and messages[0]['content'] is not string -%}\n"
+        f"{{{{- '{BOS}{REASONING_PREFIX}' -}}}}\n"
+        "{%- for message in messages -%}\n"
+        "{%- if message['role'] == 'user' -%}\n"
+        f"{{{{- '{USER}' -}}}}\n"
+        "{%- for part in message['content'] -%}\n"
+        "{%- if part['type'] == 'text' -%}{{- part['text'] -}}\n"
+        f"{{%- elif part['type'] in ['audio', 'input_audio'] -%}}{{{{- '{AUDIO_CHUNK_PLACEHOLDER}' -}}}}\n"
+        "{%- endif -%}\n"
+        "{%- endfor -%}\n"
+        "{%- elif message['role'] == 'assistant' -%}\n"
+        f"{{{{- '{ASSISTANT}{EMPTY_THINK}' -}}}}\n"
+        "{%- if message['content'] is string -%}\n"
+        "{{- message['content'] -}}\n"
+        "{%- else -%}\n"
+        "{%- for part in message['content'] -%}\n"
+        "{%- if part['type'] == 'text' -%}{{- part['text'] -}}{%- endif -%}\n"
+        "{%- endfor -%}\n"
+        "{%- endif -%}\n"
+        f"{{{{- '{TURN_END}' -}}}}\n"
+        "{%- endif -%}\n"
+        "{%- endfor -%}\n"
+        + generation_prompt
+        + "{%- else -%}\n"
+    )
+
+
+LEGACY_SIMULST_BRANCH = _simulst_branch(
+    LEGACY_MARKER,
+    f"{{%- if add_generation_prompt -%}}{{{{- '{ASSISTANT}{EMPTY_THINK}' -}}}}{{%- endif -%}}\n",
+)
+SIMULST_BRANCH = _simulst_branch(
+    MARKER,
+    f"{{%- if add_generation_prompt -%}}{{{{- '{ASSISTANT}{EMPTY_THINK}' -}}}}\n"
+    "{%- if simulst_output_mode|default('translation') == 'bilingual' -%}\n"
+    f"{{{{- '{BILINGUAL_CONTROL_TOKEN}' -}}}}\n"
+    "{%- endif -%}{%- endif -%}\n",
+)
+
+
+def _unwrap_branch(template: str, branch: str) -> str:
+    if not template.startswith(branch) or not template.endswith(BRANCH_END):
+        raise ValueError("existing SimulST chat template wrapper is malformed")
+    return template[len(branch) : -len(BRANCH_END)]
+
+
 def wrap_chat_template(original: str) -> str:
-    """Prefix ``original`` with the SimulST branch; idempotent."""
+    """Prefix ``original`` with the current SimulST branch; migrate v1."""
     if original.startswith(MARKER):
+        _unwrap_branch(original, SIMULST_BRANCH)
         return original
+    if original.startswith(LEGACY_MARKER):
+        original = _unwrap_branch(original, LEGACY_SIMULST_BRANCH)
     return SIMULST_BRANCH + original + BRANCH_END
 
 
 def unwrap_chat_template(template: str) -> str:
-    """Recover the original template from a wrapped one."""
-    if not template.startswith(MARKER):
-        return template
-    return template[len(SIMULST_BRANCH) : -len(BRANCH_END)]
+    """Recover the original template from a current or legacy wrapper."""
+    if template.startswith(MARKER):
+        return _unwrap_branch(template, SIMULST_BRANCH)
+    if template.startswith(LEGACY_MARKER):
+        return _unwrap_branch(template, LEGACY_SIMULST_BRANCH)
+    return template
 
 
 @lru_cache(maxsize=8)
@@ -129,6 +158,21 @@ def write_openai_assets(model_dir: Path) -> list[str]:
     )
     added = tokenizer_config.get("added_tokens_decoder", {})
     ids = {entry["content"]: int(token_id) for token_id, entry in added.items()}
+    bilingual_entry = added.get(str(BILINGUAL_CONTROL_TOKEN_ID))
+    if bilingual_entry is None:
+        raise ValueError(
+            f"tokenizer has no bilingual control token {BILINGUAL_CONTROL_TOKEN_ID}"
+        )
+    if bilingual_entry.get("content") != BILINGUAL_CONTROL_TOKEN:
+        raise ValueError(
+            f"token {BILINGUAL_CONTROL_TOKEN_ID} is not {BILINGUAL_CONTROL_TOKEN!r}"
+        )
+    if ids.get(BILINGUAL_CONTROL_TOKEN) != BILINGUAL_CONTROL_TOKEN_ID:
+        raise ValueError(
+            f"{BILINGUAL_CONTROL_TOKEN!r} does not map to token ID "
+            f"{BILINGUAL_CONTROL_TOKEN_ID}"
+        )
+
     required = (BOS, USER, ASSISTANT, TURN_END, AUDIO_BEGIN, AUDIO_TOKEN, AUDIO_END)
     missing = [token for token in required if token not in ids]
     if missing:

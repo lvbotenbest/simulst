@@ -9,9 +9,13 @@ from jinja2 import Environment
 from simulst_mm.chat_template import (
     ASSISTANT,
     AUDIO_CHUNK_PLACEHOLDER,
+    BILINGUAL_CONTROL_TOKEN,
+    BILINGUAL_CONTROL_TOKEN_ID,
     BOS,
     EMPTY_THINK,
     GENERATION_CONFIG_FILE,
+    LEGACY_MARKER,
+    LEGACY_SIMULST_BRANCH,
     MARKER,
     REASONING_PREFIX,
     TEMPLATE_FILE,
@@ -27,11 +31,13 @@ from simulst_mm.chat_template import (
 
 
 class ChatTemplateTest(unittest.TestCase):
-    def render(self, messages, *, add_generation_prompt=True):
+    def render(self, messages, *, add_generation_prompt=True, **kwargs):
         original = "ORIGINAL"
         template = Environment().from_string(wrap_chat_template(original))
         return template.render(
-            messages=messages, add_generation_prompt=add_generation_prompt
+            messages=messages,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
         )
 
     def test_wrap_is_reversible_and_idempotent(self):
@@ -41,6 +47,13 @@ class ChatTemplateTest(unittest.TestCase):
         self.assertEqual(wrap_chat_template(wrapped), wrapped)
         self.assertEqual(unwrap_chat_template(wrapped), original)
         self.assertEqual(unwrap_chat_template(original), original)
+
+    def test_legacy_template_is_migrated(self):
+        original = "base {{ messages }}"
+        legacy = LEGACY_SIMULST_BRANCH + original + "\n{%- endif -%}\n"
+        wrapped = wrap_chat_template(legacy)
+        self.assertTrue(wrapped.startswith(MARKER))
+        self.assertEqual(unwrap_chat_template(wrapped), original)
 
     def test_string_assistant_history_is_preserved(self):
         messages = [
@@ -76,6 +89,10 @@ class ChatTemplateTest(unittest.TestCase):
         )
         self.assertEqual(rendered, expected)
 
+    def test_malformed_legacy_template_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "wrapper is malformed"):
+            wrap_chat_template(LEGACY_MARKER + "damaged")
+
     def test_list_assistant_history_is_preserved(self):
         messages = [
             {"role": "user", "content": [{"type": "audio"}]},
@@ -85,6 +102,25 @@ class ChatTemplateTest(unittest.TestCase):
             },
         ]
         self.assertIn(f"{ASSISTANT}{EMPTY_THINK}hello{TURN_END}", self.render(messages))
+
+    def test_bilingual_control_token_is_last_generation_prompt_token(self):
+        messages = [
+            {"role": "user", "content": [{"type": "audio"}]},
+            {"role": "assistant", "content": "history"},
+            {"role": "user", "content": [{"type": "audio"}]},
+        ]
+        rendered = self.render(messages, simulst_output_mode="bilingual")
+        self.assertTrue(
+            rendered.endswith(f"{ASSISTANT}{EMPTY_THINK}{BILINGUAL_CONTROL_TOKEN}")
+        )
+        self.assertEqual(rendered.count(BILINGUAL_CONTROL_TOKEN), 1)
+
+    def test_translation_mode_does_not_add_control_token(self):
+        messages = [{"role": "user", "content": [{"type": "audio"}]}]
+        self.assertNotIn(
+            BILINGUAL_CONTROL_TOKEN,
+            self.render(messages, simulst_output_mode="translation"),
+        )
 
     def test_plain_string_conversation_uses_original_template(self):
         original = "{{ messages[0]['content'] }}"
@@ -118,6 +154,7 @@ class OpenAIAssetsTest(unittest.TestCase):
         "<｜hy_place▁holder▁no▁6｜>": 5,
         "<｜hy_place▁holder▁no▁5｜>": 6,
         "<｜hy_place▁holder▁no▁8｜>": 7,
+        BILINGUAL_CONTROL_TOKEN: BILINGUAL_CONTROL_TOKEN_ID,
     }
 
     def setUp(self):
@@ -194,6 +231,30 @@ class OpenAIAssetsTest(unittest.TestCase):
             (model / "tokenizer_config.json").write_text(json.dumps(config))
 
             with self.assertRaisesRegex(ValueError, "missing special tokens"):
+                write_openai_assets(model)
+
+    def test_missing_bilingual_control_token_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp)
+            self.make_model(model)
+            config = json.loads((model / "tokenizer_config.json").read_text())
+            config["added_tokens_decoder"].pop(str(BILINGUAL_CONTROL_TOKEN_ID))
+            (model / "tokenizer_config.json").write_text(json.dumps(config))
+
+            with self.assertRaisesRegex(ValueError, "no bilingual control token"):
+                write_openai_assets(model)
+
+    def test_conflicting_bilingual_control_token_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp)
+            self.make_model(model)
+            config = json.loads((model / "tokenizer_config.json").read_text())
+            config["added_tokens_decoder"][str(BILINGUAL_CONTROL_TOKEN_ID)][
+                "content"
+            ] = "wrong"
+            (model / "tokenizer_config.json").write_text(json.dumps(config))
+
+            with self.assertRaisesRegex(ValueError, "token 120808"):
                 write_openai_assets(model)
 
 
