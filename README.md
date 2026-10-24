@@ -4,11 +4,11 @@ Serve a speech simultaneous-interpretation stack — audio encoder, adapter, and
 LLM — as a **single vLLM model**.
 
 ```bash
-# Existing compatible vLLM GPU environment: keep its torch/CUDA stack unchanged.
-python -m pip install --no-deps simulst
+# Install the plugin from PyPI.
+pip install "simulst==0.1.0"
 
-# Or, in a fresh Python 3.12 environment whose GPU stack pip may manage:
-python -m pip install "simulst[server]"
+# Or install vLLM and its audio dependencies in a fresh Python 3.12 environment.
+pip install "simulst[server]==0.1.0"
 
 vllm serve /path/to/unified_checkpoint --served-model-name simulst
 ```
@@ -27,16 +27,16 @@ recommended default for a new environment. Choose the installation mode that
 matches the environment:
 
 ```bash
-# Existing vLLM >=0.31 GPU environment: do not let pip touch the GPU stack.
-python -m pip install --no-deps simulst
-# Add only HTTP audio decoders if that vLLM was installed without its audio extra.
-python -m pip install "simulst[audio]"
+# Existing vLLM >=0.31 GPU environment.
+pip install "simulst==0.1.0"
+# Add HTTP audio decoders if the existing vLLM lacks its audio extra.
+pip install "simulst[audio]==0.1.0"
 
-# New environment whose torch/CUDA packages may be managed by pip.
-python -m pip install "simulst[server]"
+# Fresh environment: install vLLM and audio dependencies too.
+pip install "simulst[server]==0.1.0"
 
 # Optional checkpoint-export and reference-client tools.
-python -m pip install "simulst[export,client]"
+pip install "simulst[export,client]==0.1.0"
 ```
 
 The base package intentionally does not depend on vLLM. The `audio` extra
@@ -182,7 +182,7 @@ exported separately, use an existing PyTorch/Transformers export environment,
 install the safetensors helper, and merge them:
 
 ```bash
-python -m pip install "simulst[export]"
+pip install "simulst[export]==0.1.0"
 python -m simulst_mm.export.merge_export \
   --llm    /path/to/hf_export \
   --audio  /path/to/hf_export_audio \
@@ -252,7 +252,7 @@ To run the repository's reference streaming client, use a source checkout
 (`examples/` is not installed by the wheel):
 
 ```bash
-python -m pip install "simulst[client]"
+pip install "simulst[client]==0.1.0"
 # Refresh an older unified checkpoint once to install the current chat template.
 python -m simulst_mm.chat_template --model /path/to/unified_checkpoint
 # Default: source text plus translation; appends control token 120808.
