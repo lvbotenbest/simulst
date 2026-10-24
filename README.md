@@ -19,31 +19,6 @@ package is enough: it registers the architecture through vLLM's
 in every tensor-parallel worker before the model is built. One server can accept
 multiple concurrent HTTP requests; vLLM queues and schedules them.
 
-## What problem this solves
-
-The usual way to serve a streaming speech-to-text model on vLLM is to keep the
-audio tower *outside* the engine: your serving layer loads the encoder and the
-embedding table, splices speech embeddings into text embeddings, and hands vLLM
-a finished tensor via `EmbedsPrompt`.
-
-That works, but it costs:
-
-- **a whole GPU** for a 330M-parameter tower sitting next to a tensor-parallel LLM;
-- **two export directories** that must be kept in sync;
-- **`vllm serve` itself** — you need a custom engine script instead.
-
-This package merges both halves into one checkpoint and one model class, so the
-tower is sharded onto the same GPUs as the LLM and deployment is a stock
-`vllm serve` command.
-
-### What it is *not* for
-
-Prefix caching. That already works on the `EmbedsPrompt` path — measured on a
-real engine, steady-state cache hit is 0.921 and only 5.5% of prompt tokens are
-ever prefilled. The compute saved here is about 9.6 ms/turn of re-hashing
-embeddings, roughly 1.2% of an 800 ms chunk budget. **The reason to do this is
-the deployment shape.**
-
 ## Install
 
 The plugin supports CPython **3.10, 3.11, 3.12, 3.13, and 3.14**
